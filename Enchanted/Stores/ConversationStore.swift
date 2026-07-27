@@ -32,22 +32,28 @@ final class ConversationStore: Sendable {
     @MainActor var selectedConversation: ConversationSD?
     @MainActor var messages: [MessageSD] = []
     
+    /// Messages created during the current `sendPrompt` call that have not yet
+    /// been written to the database. They are persisted in
+    /// `handleComplete`/`handleError` AFTER streaming finishes, so the assistant
+    /// message is inserted with its final, fully-streamed content. Persisting
+    /// them earlier would insert the assistant empty and then mutate it
+    /// off-context, where SwiftData would never see the changes.
+    @MainActor var pendingNewMessages: [MessageSD] = []
+    
     init(swiftDataService: SwiftDataService) {
         self.swiftDataService = swiftDataService
     }
     
     func loadConversations() async throws {
-        print("loading conversations")
         let fetchedConversations = try await swiftDataService.fetchConversations()
-        DispatchQueue.main.async {
+        await MainActor.run {
             self.conversations = fetchedConversations
         }
-        print("loaded conversations")
     }
     
     func deleteAllConversations() {
         Task {
-            DispatchQueue.main.async { [weak self] in
+            await MainActor.run { [weak self] in
                 self?.messages = []
                 self?.selectedConversation = nil
             }
@@ -59,29 +65,28 @@ final class ConversationStore: Sendable {
     
     func deleteDailyConversations(_ date: Date) {
         Task {
-            DispatchQueue.main.async { [self] in
-                selectedConversation = nil
-                messages = []
+            await MainActor.run { [weak self] in
+                self?.selectedConversation = nil
+                self?.messages = []
             }
-            try? await swiftDataService.deleteConversations()
+            // Use the date-scoped overload so we only delete conversations from that day.
+            try? await swiftDataService.deleteConversations(date)
             try? await loadConversations()
         }
     }
-    
     
     func create(_ conversation: ConversationSD) async throws {
         try await swiftDataService.createConversation(conversation)
     }
     
     func reloadConversation(_ conversation: ConversationSD) async throws {
-        let (messages, selectedConversation) = try await (
+        let (fetchedMessages, fetchedConversation) = try await (
             swiftDataService.fetchMessages(conversation.id),
             swiftDataService.getConversation(conversation.id)
         )
-        
-        DispatchQueue.main.async {
-                self.messages = messages
-                self.selectedConversation = selectedConversation
+        await MainActor.run {
+            self.messages = fetchedMessages
+            self.selectedConversation = fetchedConversation
         }
     }
     
@@ -92,7 +97,7 @@ final class ConversationStore: Sendable {
     func delete(_ conversation: ConversationSD) async throws {
         try await swiftDataService.deleteConversation(conversation)
         let fetchedConversations = try await swiftDataService.fetchConversations()
-        DispatchQueue.main.async {
+        await MainActor.run {
             self.selectedConversation = nil
             self.conversations = fetchedConversations
         }
@@ -114,81 +119,128 @@ final class ConversationStore: Sendable {
         conversation.updatedAt = Date.now
         conversation.model = model
         
-        print("model", model.name)
-        print("conversation", conversation.name)
+        // If this is a new conversation, set it as selected immediately AND clear old messages
+        if selectedConversation == nil {
+            selectedConversation = conversation
+            messages = []
+        }
         
         /// trim conversation if on edit mode
         if let trimmingMessageId = trimmingMessageId {
-            conversation.messages = conversation.messages
-                .sorted{$0.createdAt < $1.createdAt}
-                .prefix(while: {$0.id.uuidString != trimmingMessageId})
+            messages = Array(
+                messages
+                    .sorted { $0.createdAt < $1.createdAt }
+                    .prefix(while: { $0.id.uuidString != trimmingMessageId })
+            )
         }
         
-        /// add system prompt to very first message in the conversation
-        if !systemPrompt.isEmpty && conversation.messages.isEmpty {
+        // Track only the messages created in this call. They are persisted after
+        // streaming completes (see handleComplete/handleError). We deliberately do
+        // NOT persist them here, because the assistant placeholder is empty at
+        // this point and would be mutated off-context during streaming.
+        pendingNewMessages = []
+        
+        /// add system prompt to very first message in the conversation.
+        /// IMPORTANT: append to `messages` (the in-memory source of truth) too,
+        /// otherwise it never gets persisted and never gets sent to stateless agents.
+        if !systemPrompt.isEmpty && messages.isEmpty {
             let systemMessage = MessageSD(content: systemPrompt, role: "system")
             systemMessage.conversation = conversation
+            messages.append(systemMessage)
+            pendingNewMessages.append(systemMessage)
         }
         
-        /// construct new message
+        /// construct new user message. `compressImageData()` now produces a
+        /// high-fidelity JPEG (max 1568px longest side, q0.85) — the same image
+        /// that gets stored on `MessageSD.image` and re-transmitted to stateless
+        /// agents on follow-up turns, so the current turn and every later turn
+        /// see the same high-quality image.
         let userMessage = MessageSD(content: userPrompt, role: "user", image: image?.render()?.compressImageData())
         userMessage.conversation = conversation
+        messages.append(userMessage)
+        pendingNewMessages.append(userMessage)
         
-        /// prepare message history for Ollama
-        var messageHistory = conversation.messages
-            .sorted{$0.createdAt < $1.createdAt}
-            .map{OKChatRequestData.Message(role: OKChatRequestData.Message.Role(rawValue: $0.role) ?? .assistant, content: $0.content)}
-        
-        
-        print(messageHistory.map({$0.content}))
-        
-        /// attach selected image to the last Message
-        if let image = image?.render() {
-            if let lastMessage = messageHistory.popLast() {
-                let imagesBase64: [String] = [image.convertImageToBase64String()]
-                let messageWithImage = OKChatRequestData.Message(role: lastMessage.role, content: lastMessage.content, images: imagesBase64)
-                messageHistory.append(messageWithImage)
-            }
-        }
-        
+        /// construct assistant placeholder. It stays empty in memory until the
+        /// stream fills it in; it is inserted into the database with its final
+        /// content in handleComplete().
         let assistantMessage = MessageSD(content: "", role: "assistant")
         assistantMessage.conversation = conversation
+        messages.append(assistantMessage)
+        pendingNewMessages.append(assistantMessage)
+        
+        /// Build the outgoing history ONCE, from `messages`, EXCLUDING the empty
+        /// assistant placeholder (the last element). This is the single source of
+        /// truth used by both the Ollama and the agent paths, so they behave the
+        /// same. For stateless (E2EE) agents this includes the system prompt and
+        /// the full prior history every time — no DB reload required, because the
+        /// in-memory `messages` array already has everything.
+        ///
+        /// Images are re-attached from `MessageSD.image` on every turn. This is
+        /// required for stateless (E2EE) agents, which forget everything between
+        /// calls — without re-transmission, a follow-up question about an image
+        /// sent earlier would reach the agent with no image in context. It's
+        /// also correct for Ollama's per-request `/api/chat`: each request is
+        /// self-contained, so prior images must travel with their messages.
+        ///
+        /// The current turn's image is the same high-fidelity JPEG stored on the
+        /// just-created user message (via `compressImageData()`), so there's no
+        /// separate full-quality override — turn 1 and turn N see identical
+        /// image bytes.
+        let messageHistory: [OKChatRequestData.Message] = messages.dropLast()
+            .sorted { $0.createdAt < $1.createdAt }
+            .map { message in
+                // `MessageSD.image` already holds the high-fidelity JPEG written
+                // at creation time via `compressImageData()`. Base64-encode it for
+                // the Ollama `images` field; `sendAgentPrompt` converts that into
+                // OpenAI `image_url` data-URI parts for the agent path.
+                let images: [String] = message.image.map { [$0.base64EncodedString()] } ?? []
+                return OKChatRequestData.Message(
+                    role: OKChatRequestData.Message.Role(rawValue: message.role) ?? .assistant,
+                    content: message.content,
+                    images: images
+                )
+            }
         
         conversationState = .loading
         
+        let isAgent = model.isAgent
+        let agentAddress = model.agentAddress
+        let modelName = model.name
+        
         Task {
-            try await swiftDataService.updateConversation(conversation)
-            try await swiftDataService.createMessage(userMessage)
-            try await swiftDataService.createMessage(assistantMessage)
-            try await reloadConversation(conversation)
-            try? await loadConversations()
-            
-            if await OllamaService.shared.ollamaKit.reachable() {
-                DispatchQueue.global(qos: .background).async {
-                    var request = OKChatRequestData(model: model.name, messages: messageHistory)
-                    request.options = OKCompletionOptions(temperature: 0)
-                    
-                    self.generation = OllamaService.shared.ollamaKit.chat(data: request)
-                        .sink(receiveCompletion: { [weak self] completion in
-                            switch completion {
-                            case .finished:
-                                self?.handleComplete()
-                            case .failure(let error):
-                                self?.handleError(error.localizedDescription)
-                            }
-                        }, receiveValue: { [weak self] response in
-                            self?.handleReceive(response)
-                        })
-                    
-                }
+            if isAgent, let agentAddress = agentAddress {
+                await sendAgentPrompt(agentAddress: agentAddress, messageHistory: messageHistory)
             } else {
-                self.handleError("Server unreachable")
+                if await OllamaService.shared.ollamaKit.reachable() {
+                    DispatchQueue.global(qos: .background).async {
+                        var request = OKChatRequestData(model: modelName, messages: messageHistory)
+                        request.options = OKCompletionOptions(temperature: 0)
+                        
+                        self.generation = OllamaService.shared.ollamaKit.chat(data: request)
+                            .sink(receiveCompletion: { [weak self] completion in
+                                Task { @MainActor [weak self] in
+                                    switch completion {
+                                    case .finished:
+                                        self?.handleComplete()
+                                    case .failure(let error):
+                                        self?.handleError(error.localizedDescription)
+                                    }
+                                }
+                            }, receiveValue: { [weak self] response in
+                                Task { @MainActor [weak self] in
+                                    self?.handleReceive(response)
+                                }
+                            })
+                    }
+                } else {
+                    self.handleError("Server unreachable")
+                }
             }
         }
     }
     
     @MainActor
-    private func handleReceive(_ response: OKChatResponse)  {
+    private func handleReceive(_ response: OKChatResponse) {
         if messages.isEmpty { return }
         
         if let responseContent = response.message?.content {
@@ -204,14 +256,128 @@ final class ConversationStore: Sendable {
     }
     
     @MainActor
-    private func handleError(_ errorMessage: String) {
-        guard let lastMesasge = messages.last else { return }
-        lastMesasge.error = true
-        lastMesasge.done = false
+    private func sendAgentPrompt(agentAddress: String, messageHistory: [OKChatRequestData.Message]) async {
+        if let ollamaUri = UserDefaults.standard.string(forKey: "ollamaUri"),
+           let baseURL = URL(string: ollamaUri) {
+            let bearerToken = UserDefaults.standard.string(forKey: "ollamaBearerToken")
+            AgentService.shared.configure(baseURL: baseURL, bearerToken: bearerToken)
+        }
+        
+        // Convert Ollama-style messages to OpenAI Chat Completions format.
+        // Text-only messages get a plain string `content`; messages with images
+        // get an OpenAI content array with `text` and `image_url` parts. The
+        // Osaurus agent run endpoint speaks OpenAI format (its streaming
+        // responses use `choices`/`delta`), so images must travel as
+        // `image_url` data URIs — not the Ollama `images` field, which the
+        // endpoint silently ignores.
+        let agentMessages = messageHistory.map { msg in
+            AgentMessage(role: msg.role.rawValue, text: msg.content, images: msg.images)
+        }
+        
+        let imageCount = messageHistory.reduce(0) { $0 + ($1.images.count) }
+        if imageCount > 0 {
+            print("🖼️ Sending \(imageCount) image(s) to agent as OpenAI image_url content parts (incl. re-transmitted history)")
+        }
+        
+        currentMessageBuffer = ""
+        
+        self.generation = AgentService.shared.runAgent(address: agentAddress, messages: agentMessages)
+            .sink(receiveCompletion: { [weak self] completion in
+                Task { @MainActor [weak self] in
+                    switch completion {
+                    case .finished:
+                        self?.handleComplete()
+                    case .failure(let error):
+                        self?.handleError(error.localizedDescription)
+                    }
+                }
+            }, receiveValue: { [weak self] response in
+                Task { @MainActor [weak self] in
+                    self?.handleAgentReceive(response)
+                }
+            })
+    }
+    
+    @MainActor
+    private func handleAgentReceive(_ response: AgentRunResponse) {
+        if messages.isEmpty { return }
+        
+        // Handle content from either format (Osaurus or OpenAI)
+        if let content = response.content, !content.isEmpty {
+            currentMessageBuffer = currentMessageBuffer + content
+            
+            throttler.throttle { [weak self] in
+                guard let self = self else { return }
+                guard !self.messages.isEmpty else { return }
+                let lastIndex = self.messages.count - 1
+                self.messages[lastIndex].content = self.currentMessageBuffer
+            }
+        }
+        
+        // Handle tool progress hints (Osaurus format only)
+        if let toolProgress = response.message?.toolProgress {
+            let annotation = "[tool call: \(toolProgress)]"
+            
+            throttler.throttle { [weak self] in
+                guard let self = self else { return }
+                guard !self.messages.isEmpty else { return }
+                let lastIndex = self.messages.count - 1
+                if !self.messages[lastIndex].content.contains(annotation) {
+                    self.messages[lastIndex].content.append("\n\(annotation)")
+                }
+            }
+        }
+    }
+    
+    /// Persist the conversation (if new) and any messages created during the
+    /// current `sendPrompt` call. Called from `handleComplete` and `handleError`
+    /// after streaming has finished, so the assistant message is inserted with
+    /// its final content.
+    @MainActor
+    private func persistPendingMessages() {
+        let conversationToSave = selectedConversation
+        let messagesToSave = pendingNewMessages
+        
+        // Clear now (synchronously, on MainActor) so a subsequent sendPrompt can't
+        // race with the background save below. The Task captures messagesToSave.
+        pendingNewMessages = []
         
         Task(priority: .background) {
-            try? await swiftDataService.updateMessage(lastMesasge)
+            do {
+                if let conv = conversationToSave {
+                    let existsInDb = try await self.swiftDataService.getConversation(conv.id) != nil
+                    if !existsInDb {
+                        try await self.swiftDataService.createConversation(conv)
+                    }
+                    for message in messagesToSave {
+                        try await self.swiftDataService.createMessage(message)
+                    }
+                    try await self.swiftDataService.updateConversation(conv)
+                }
+            } catch {
+                print("❌ Error persisting messages: \(error)")
+            }
+            
+            // Refresh the sidebar so the new/updated conversation appears.
+            try? await self.loadConversations()
         }
+    }
+    
+    @MainActor
+    private func handleError(_ errorMessage: String) {
+        guard let lastMessage = messages.last else {
+            withAnimation {
+                conversationState = .error(message: errorMessage)
+            }
+            return
+        }
+        
+        lastMessage.error = true
+        lastMessage.done = false
+        
+        // Even on error, persist what we have so the conversation + user message
+        // (and any partial assistant reply) aren't lost.
+        persistPendingMessages()
         
         withAnimation {
             conversationState = .error(message: errorMessage)
@@ -220,13 +386,20 @@ final class ConversationStore: Sendable {
     
     @MainActor
     private func handleComplete() {
-        guard let lastMesasge = messages.last else { return }
-        lastMesasge.error = false
-        lastMesasge.done = true
-        
-        Task(priority: .background) {
-            try await self.swiftDataService.updateMessage(lastMesasge)
+        guard let lastMessage = messages.last else {
+            withAnimation {
+                conversationState = .completed
+            }
+            return
         }
+        
+        // Finalize the assistant message. It was created empty in sendPrompt and
+        // filled during streaming; persistPendingMessages() inserts it (and any
+        // other new messages) now, capturing its final content at insert time.
+        lastMessage.error = false
+        lastMessage.done = true
+        
+        persistPendingMessages()
         
         withAnimation {
             conversationState = .completed

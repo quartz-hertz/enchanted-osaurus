@@ -21,9 +21,16 @@ struct ModelSelectorView: View {
                         onSelectModel(model)
                     }
                 }) {
-                    Text(model.name)
-                        .font(.body)
-                        .tag(model.name)
+                    HStack {
+                        // Show agent icon if this is an agent
+                        if model.isAgent {
+                            Image(systemName: "person.badge.key.fill")
+                                .foregroundStyle(.blue)
+                        }
+                        Text(model.displayName)
+                            .font(.body)
+                    }
+                    .tag(model.name)
                 }
             }
         } label: {
@@ -31,17 +38,31 @@ struct ModelSelectorView: View {
                 if let selectedModel = selectedModel {
                     HStack(alignment: .bottom, spacing: 5) {
                         
+                        // Show agent icon if selected model is an agent
+                        if selectedModel.isAgent {
+                            Image(systemName: "person.badge.key.fill")
+                                .foregroundStyle(.blue)
+                                .font(.caption)
+                        }
+                        
                         #if os(macOS) || os(visionOS)
-                        Text(selectedModel.name)
+                        Text(selectedModel.displayName)
                             .font(.body)
                         #elseif os(iOS)
-                        Text(selectedModel.prettyName )
-                            .font(.body)
-                            .foregroundColor(Color.labelCustom)
-                        
-                        Text(selectedModel.prettyVersion)
-                            .font(.subheadline)
-                            .foregroundColor(Color.gray3Custom)
+                        // For agents, show full name; for models, show pretty name
+                        if selectedModel.isAgent {
+                            Text(selectedModel.displayName)
+                                .font(.body)
+                                .foregroundColor(Color.labelCustom)
+                        } else {
+                            Text(selectedModel.prettyName)
+                                .font(.body)
+                                .foregroundColor(Color.labelCustom)
+                            
+                            Text(selectedModel.prettyVersion)
+                                .font(.subheadline)
+                                .foregroundColor(Color.gray3Custom)
+                        }
                         #endif
                     }
                 }

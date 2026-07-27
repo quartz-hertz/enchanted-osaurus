@@ -13,26 +13,26 @@ final class MessageSD: Identifiable {
     @Attribute(.unique) var id: UUID = UUID()
     
     var think: String? {
-        if content.contains("<think>") {
-            if content.contains("</think>") {
-                let tmps = content.components(separatedBy: "</think>")
+        if content.contains("") {
+            if content.contains("") {
+                let tmps = content.components(separatedBy: "")
                 if tmps.count > 1 {
-                    return tmps[0].replacingOccurrences(of: "<think>", with: "")
+                    return tmps[0].replacingOccurrences(of: "", with: "")
                 }
             }
-            return content.replacingOccurrences(of: "<think>", with: "")
+            return content.replacingOccurrences(of: "", with: "")
         }
         return nil
     }
     var hasThink: Bool {
-        if content.contains("<think>") {
+        if content.contains("") {
             return true
         }
         return false
     }
     var thinkComplete: Bool {
-        if content.contains("<think>") {
-            if content.contains("</think>") {
+        if content.contains("") {
+            if content.contains("") {
                 return true
             }
         }
@@ -40,9 +40,9 @@ final class MessageSD: Identifiable {
     }
     var content: String
     var realContent: String? {
-        if content.contains("<think>") {
-            if content.contains("</think>") {
-                let tmps = content.components(separatedBy: "</think>")
+        if content.contains("") {
+            if content.contains("") {
+                let tmps = content.components(separatedBy: "")
                 if tmps.count > 1 {
                     return tmps[1]
                 }
@@ -58,14 +58,12 @@ final class MessageSD: Identifiable {
     @Attribute(.externalStorage) var image: Data?
     
     @Relationship var conversation: ConversationSD?
-        
     
     init(content: String, role: String, done: Bool = false, error: Bool = false, image: Data? = nil) {
         self.content = content
         self.role = role
         self.done = done
         self.error = error
-        self.conversation = conversation
         self.image = image
     }
 

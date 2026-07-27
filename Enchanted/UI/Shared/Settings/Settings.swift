@@ -27,6 +27,8 @@ struct Settings: View {
     
     @Environment(\.presentationMode) var presentationMode
     
+    @State private var showExport = false
+    
     private let timer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
     @State private var cancellable: AnyCancellable?
     
@@ -41,7 +43,7 @@ struct Settings: View {
         OllamaService.shared.initEndpoint(url: ollamaUri, bearerToken: ollamaBearerToken)
         Task {
             Haptics.shared.mediumTap()
-            try? await languageModelStore.loadModels()
+            try? await languageModelStore.loadModelsAndAgents()
         }
         presentationMode.wrappedValue.dismiss()
     }
@@ -50,7 +52,7 @@ struct Settings: View {
         Task {
             OllamaService.shared.initEndpoint(url: ollamaUri)
             ollamaStatus = await OllamaService.shared.reachable()
-            try? await languageModelStore.loadModels()
+            try? await languageModelStore.loadModelsAndAgents()
         }
     }
     

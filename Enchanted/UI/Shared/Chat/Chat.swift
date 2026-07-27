@@ -85,7 +85,7 @@ struct Chat: View, Sendable {
         
         Task {
             await Haptics.shared.mediumTap()
-            try? await languageModelStore.loadModels()
+            try? await languageModelStore.loadModelsAndAgents()
         }
         
 #if os(iOS)

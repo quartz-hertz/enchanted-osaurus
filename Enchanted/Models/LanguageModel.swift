@@ -15,4 +15,7 @@ struct LanguageModel {
 
 enum ModelProvider: Codable {
     case ollama
+    /// Osaurus agent exposed via the /agents endpoint. Agent models are
+    /// persisted as first-class `LanguageModelSD` rows with this provider.
+    case osaurus
 }

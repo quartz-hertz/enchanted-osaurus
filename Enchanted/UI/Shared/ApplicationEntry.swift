@@ -33,7 +33,7 @@ struct ApplicationEntry: View {
             }
             
             Task.detached {
-                async let loadModels: () = languageModelStore.loadModels()
+                async let loadModels: () = languageModelStore.loadModelsAndAgents()
                 async let loadConversations: () = conversationStore.loadConversations()
                 async let loadCompletions: () = completionsStore.load()
                 

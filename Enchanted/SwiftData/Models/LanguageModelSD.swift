@@ -15,14 +15,30 @@ final class LanguageModelSD: Identifiable {
     var imageSupport: Bool = false
     @Attribute var modelProvider: ModelProvider? = ModelProvider.ollama
     
+    /// Whether this row represents an Osaurus agent rather than an Ollama model.
+    /// Persisted (NOT @Transient) so agent models are first-class managed
+    /// objects, exactly like Ollama models, and `conversation.model` is always
+    /// a managed object after a fetch. Adding a stored property with a default
+    /// is a lightweight SwiftData migration, so existing Ollama rows get
+    /// `isAgent == false` automatically.
+    var isAgent: Bool = false
+    
+    /// Address used to run the agent (Osaurus `agent.address`, i.e. the 0x…
+    /// Ethereum address when available, otherwise the agent UUID). Persisted
+    /// — NOT @Transient — so it survives fetches and is available off-context
+    /// (e.g. in `ConversationStore.sendPrompt` after a conversation reload).
+    var agentAddress: String? = nil
+    
     @Relationship(deleteRule: .cascade, inverse: \ConversationSD.model)
     var conversations: [ConversationSD]? = []
     
     
-    init(name: String, imageSupport: Bool = false, modelProvider: ModelProvider) {
+    init(name: String, imageSupport: Bool = false, modelProvider: ModelProvider, isAgent: Bool = false, agentAddress: String? = nil) {
         self.name = name
         self.imageSupport = imageSupport
         self.modelProvider = modelProvider
+        self.isAgent = isAgent
+        self.agentAddress = agentAddress
     }
     
     @Transient var isNotAvailable: Bool {

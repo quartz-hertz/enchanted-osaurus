@@ -68,7 +68,7 @@ struct ChatMessageView: View {
                                 .frame(width: 10)
                             if showThink {
                                 if let think = message.think {
-                                    Markdown(think)
+                                    Markdown(think.latexToUnicode)
 #if os(macOS)
                                         .textSelection(.enabled)
 #endif
@@ -89,12 +89,7 @@ struct ChatMessageView: View {
                           }
                     }
                     if let content = message.realContent {
-                        Markdown(content)
-    #if os(macOS)
-                            .textSelection(.enabled)
-    #endif
-                            .markdownCodeSyntaxHighlighter(.splash(theme: codeHighlightColorScheme))
-                            .markdownTheme(MarkdownColours.enchantedTheme)
+                        MessageContentView(content: content)
                     }
                     
                     if let uiImage = image {

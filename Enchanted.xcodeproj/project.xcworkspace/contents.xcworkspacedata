@@ -4,4 +4,7 @@
    <FileRef
       location = "self:">
    </FileRef>
+   <FileRef
+      location = "group:OSAURUS_0.21.1_E2EE_NOTE.md">
+   </FileRef>
 </Workspace>
